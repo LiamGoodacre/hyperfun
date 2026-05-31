@@ -17,10 +17,16 @@ common warnings
     ghc-options: -Wall
 
 executable hyperfun
-    import:           warnings
-    main-is:          Main.hs
-    -- other-modules:
-    -- other-extensions:
-    build-depends:    base ^>=4.21.0.0
+    import: warnings
+    ghc-options: -O2
+    main-is: Main.hs
+    build-depends:
+      base ^>=4.21.0.0,
+      free,
+      profunctors,
     hs-source-dirs:   app
     default-language: GHC2024
+    default-extensions:
+      BlockArguments,
+      DerivingVia,
+      LambdaCase,
