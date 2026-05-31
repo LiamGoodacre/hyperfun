@@ -18,6 +18,23 @@ run :: (a -&> a) -> a
 run h = invoke h id
 {-# INLINE run #-}
 
+newtype IxH g h x = IxH {invokeIxH :: (forall y. IxH g h y -> g y) -> h x}
+
+runIxH :: IxH g g x -> g x
+runIxH h = invokeIxH h runIxH
+{-# INLINE runIxH #-}
+
+ipure :: h x -> IxH g h x
+ipure x = IxH \_ -> x
+{-# INLINE ipure #-}
+
+icons :: (g y -> h x) -> IxH g h y -> IxH g h x
+icons f t = IxH \k -> f (k t)
+{-# INLINE icons #-}
+
+ixComp :: (x -> y -> z) -> IxH f g x -> IxH h g y -> IxH h g z
+ixComp = undefined
+
 instance Category (-&>) where
   id = H \k -> invoke k id
   {-# INLINE id #-}
@@ -144,36 +161,34 @@ longInterleaving = do
 
 apFold ::
   forall x f g h.
-  (Functor f, Functor g, Functor h) =>
   Ap f x ->
   (forall a b. f a -> g (a -> b) -> h b) ->
-  (x -> h x) ->
-  g x -&> h x
+  (forall a. a -> h a) ->
+  IxH g h x
 apFold ap c n = case ap of
-  Ap.Pure x -> pure (n x)
-  Ap.Ap @_ @y h t -> do
-    _implement_me
+  Ap.Pure x -> ipure (n x)
+  Ap.Ap h t -> icons (c h) (apFold t c n)
 
 apBuild ::
   ( forall g h.
-    ( forall a.
-      f a ->
-      g (a -> x) ->
-      h x
-    ) ->
-    (x -> h x) ->
-    (g x -&> h x)
+    (forall a b. f a -> g (a -> b) -> h b) ->
+    (forall a. a -> h a) ->
+    IxH g h x
   ) ->
   Ap f x
-apBuild g = run (g Ap.Ap Ap.Pure)
+apBuild g = runIxH (g Ap.Ap Ap.Pure)
 
--- longInterleavingAp :: (x -> y -> z) -> Ap f x -> Ap g y -> Ap f z
--- longInterleavingAp = do
---   let useAll = undefined
---   \l r -> run (
---   run . fix \me -> \case
---     Ap.Ap h t -> useAll h . me t
---     Ap.Pure x -> id x
+longInterleavingAp :: forall f z y x. (x -> y -> z) -> Ap f x -> Ap f y -> Ap f z
+longInterleavingAp = do
+  let use :: f i -> IxH (Ap f) (Ap f) (i -> j) -> IxH (Ap f) (Ap f) j
+      use a b = IxH \k -> Ap.Ap a (k b)
+
+  let useAll :: Ap f i -> IxH (Ap f) (Ap f) i
+      useAll = \case
+        Ap.Ap h t -> use h (useAll t)
+        Ap.Pure v -> ipure (Ap.Pure v)
+
+  \f l r -> runIxH (ixComp f (useAll l) (useAll r))
 
 {- {{{ longInterleaving trace-ish
 
@@ -797,6 +812,18 @@ main = do
               . (fix \me -> H \k n -> (1, n * 100) : (invoke k me $! n + 2))
               . (fix \me -> H \k n -> (2, n * 100) : (invoke k me $! n + 3))
           )
+
+  --
+  print @[(Int, Int)] $
+    Ap.retractAp
+      ( apBuild
+          ( apFold
+              ( (,)
+                  <$> Ap.liftAp [1, 2, 3]
+                  <*> Ap.liftAp [1, 2, 3]
+              )
+          )
+      )
 
   -- print $ grun (gsingle 1 :: G Int Int Int)
   mempty
