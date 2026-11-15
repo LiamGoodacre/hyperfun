@@ -1,39 +1,46 @@
 module Main where
 
-import Control.Applicative.Free (Ap)
-import Control.Applicative.Free qualified as Ap
 import Control.Category
-import Control.Monad.Fix (fix)
 import Data.Coerce (coerce)
-import Data.Foldable (toList)
 import Data.Function ((&))
-import Data.Functor.Compose (Compose (..))
-import Data.List (tails)
 import Data.Profunctor
 import Prelude hiding (id, (.))
 
 newtype a -&> b = H {invoke :: (b -&> a) -> b}
 
-run :: (a -&> a) -> a
+type Process a = a -&> a
+
+run :: Process a -> a
 run h = invoke h id
 {-# INLINE run #-}
 
-newtype IxH g h x = IxH {invokeIxH :: (forall y. IxH g h y -> g y) -> h x}
+(!>) :: (i -> o) -> (i -&> o) -> (i -&> o)
+a !> b = H \k -> a (invoke k b)
+{-# INLINE (!>) #-}
 
-runIxH :: IxH g g x -> g x
-runIxH h = invokeIxH h runIxH
-{-# INLINE runIxH #-}
+fold_with ::
+  (Foldable f, Category cat) =>
+  (y -> cat a a -> cat a a) ->
+  (x -> y) ->
+  f x ->
+  cat a a
+fold_with o t = foldr (\a r -> o (t a) r) id
+{-# INLINE fold_with #-}
 
-ipure :: h x -> IxH g h x
-ipure x = IxH \_ -> x
-{-# INLINE ipure #-}
+longInterleaving :: forall a f g. (Foldable f, Foldable g) => f (g a) -> [a]
+longInterleaving fga = do
+  let make_each_process :: Process (Bool -> [a])
+      make_each_process =
+        fga & fold_with (.) \ga ->
+          ga & fold_with (!>) \a next ->
+            \_continuing -> a : next True
 
-icons :: (g y -> h x) -> IxH g h y -> IxH g h x
-icons f t = IxH \k -> f (k t)
-{-# INLINE icons #-}
+  let loop_or_stop :: Process (Bool -> [a])
+      loop_or_stop = rep \next ->
+        \continuing -> if continuing then next False else []
 
-ixComp :: (x -> y -> z) -> IxH f g x -> IxH h g y -> IxH h g z
-ixComp = undefined
+  run (make_each_process . loop_or_stop) False
+{-# INLINE longInterleaving #-}
 
 instance Category (-&>) where
   id = H \k -> invoke k id
@@ -81,21 +88,17 @@ instance Applicative ((-&>) a) where
     unroll i (\i' -> fga (i', j)) $ unroll j (\j' -> fga (i, j'))
   {-# INLINE (<*>) #-}
 
-(<***>) :: forall z a b. (z -&> (a -> b)) -> (z -&> a) -> z -&> b
-(<***>) z_ab z_a = H \bz -> do
-  let f = invoke z_ab (H \z_ab' -> invoke bz (z_ab' <***> z_a))
-  let x = invoke z_a (H \z_a' -> invoke bz (z_ab <***> z_a'))
-  f x
+-- (<***>) :: forall z a b. (z -&> (a -> b)) -> (z -&> a) -> z -&> b
+-- (<***>) z_ab z_a = H \bz -> do
+--   let f = invoke z_ab (H \z_ab' -> invoke bz (z_ab' <***> z_a))
+--   let x = invoke z_a (H \z_a' -> invoke bz (z_ab <***> z_a'))
+--   f x
 
 instance Monad ((-&>) a) where
   return = pure
   {-# INLINE return #-}
   m >>= f = cata (\g -> roll $ \k -> unroll (f (g k)) k) m
   {-# INLINE (>>=) #-}
-
-(!>) :: (i -> o) -> (i -&> o) -> (i -&> o)
-a !> b = H \k -> a (invoke k b)
-{-# INLINE (!>) #-}
 
 infixr 5 !>
 
@@ -146,8 +149,8 @@ longInterleave = do
   \l r -> kickit (foldr use id l . foldr use id r)
 {-# INLINE longInterleave #-}
 
-longInterleaving :: forall a f g. (Foldable f, Foldable g) => f (g a) -> [a]
-longInterleaving = do
+longInterleavingOld :: forall a f g. (Foldable f, Foldable g) => f (g a) -> [a]
+longInterleavingOld = do
   -- We have a boolean flag passed along through the processes.
   -- The flag starts out as False from kickit.
   -- When a process has something to contribute, it replaces it with True.
@@ -157,306 +160,7 @@ longInterleaving = do
   let useAll = foldr use id
   let kickit j = invoke j (H \k b -> if b then kickit k else []) False
   kickit . foldr (\xs r -> useAll xs . r) id
-{-# INLINE longInterleaving #-}
-
-apFold ::
-  forall x f g h.
-  Ap f x ->
-  (forall a b. f a -> g (a -> b) -> h b) ->
-  (forall a. a -> h a) ->
-  IxH g h x
-apFold ap c n = case ap of
-  Ap.Pure x -> ipure (n x)
-  Ap.Ap h t -> icons (c h) (apFold t c n)
-
-apBuild ::
-  ( forall g h.
-    (forall a b. f a -> g (a -> b) -> h b) ->
-    (forall a. a -> h a) ->
-    IxH g h x
-  ) ->
-  Ap f x
-apBuild g = runIxH (g Ap.Ap Ap.Pure)
-
-longInterleavingAp :: forall f z y x. (x -> y -> z) -> Ap f x -> Ap f y -> Ap f z
-longInterleavingAp = do
-  let use :: f i -> IxH (Ap f) (Ap f) (i -> j) -> IxH (Ap f) (Ap f) j
-      use a b = IxH \k -> Ap.Ap a (k b)
-
-  let useAll :: Ap f i -> IxH (Ap f) (Ap f) i
-      useAll = \case
-        Ap.Ap h t -> use h (useAll t)
-        Ap.Pure v -> ipure (Ap.Pure v)
-
-  \f l r -> runIxH (ixComp f (useAll l) (useAll r))
-
-{- {{{ longInterleaving trace-ish
-
-longInterleaving
-  [ [1, 4],
-    [2, 5, 7, 8, 9],
-    [3, 6]
-  ]
-
-kickit
-  ( useAll [1, 4] .
-    useAll [2, 5, 7, 8, 9] .
-    useAll [3, 6] .
-    id
-  )
-
-invoke
-  ( use 1 (use 4 id) .
-    use 2 (use 5 (use 7 (use 8 (use 9 id)))) .
-    use 3 (use 6 id) .
-    id
-  )
-  (H \k b -> if b then kickit k else [])
-  False
-
-invoke
-  (H \k ->
-    invoke
-      (use 1 (use 4 id))
-      ( use 2 (use 5 (use 7 (use 8 (use 9 id)))) .
-        use 3 (use 6 id) .
-        id .
-        k
-      )
-  )
-  (H \k b -> if b then kickit k else [])
-  False
-
-invoke
-  (use 1 (use 4 id))
-  ( use 2 (use 5 (use 7 (use 8 (use 9 id)))) .
-    use 3 (use 6 id) .
-    id .
-    (H \k b -> if b then kickit k else [])
-  )
-  False
-
-  1 :
-    invoke
-      ( use 2 (use 5 (use 7 (use 8 (use 9 id)))) .
-        use 3 (use 6 id) .
-        id .
-        (H \k b -> if b then kickit k else [])
-      )
-      (use 4 id)
-      True
-
-  1 :
-    invoke
-      (H \k ->
-        invoke
-          (use 2 (use 5 (use 7 (use 8 (use 9 id)))))
-          ( use 3 (use 6 id) .
-            id .
-            (H \k b -> if b then kickit k else []) .
-            k
-          )
-      )
-      (use 4 id)
-      True
-
-  1 :
-    invoke
-      (use 2 (use 5 (use 7 (use 8 (use 9 id)))))
-      ( use 3 (use 6 id) .
-        id .
-        (H \k b -> if b then kickit k else []) .
-        (use 4 id)
-      )
-      True
-
-  1 : 2 :
-    invoke
-      ( use 3 (use 6 id) .
-        id .
-        (H \k b -> if b then kickit k else []) .
-        (use 4 id)
-      )
-      (use 5 (use 7 (use 8 (use 9 id))))
-      True
-
-  1 : 2 :
-    invoke
-      (use 3 (use 6 id))
-      ( id .
-        (H \k b -> if b then kickit k else []) .
-        use 4 id .
-        use 5 (use 7 (use 8 (use 9 id)))
-      )
-      True
-
-  1 : 2 : 3 :
-    invoke
-      ( id .
-        (H \k b -> if b then kickit k else []) .
-        use 4 id .
-        use 5 (use 7 (use 8 (use 9 id)))
-      )
-      (use 6 id)
-      True
-
-  1 : 2 : 3 :
-    invoke
-      ( (H \k b -> if b then kickit k else []) .
-        use 4 id .
-        use 5 (use 7 (use 8 (use 9 id))) .
-        use 6 id
-      )
-      id
-      True
-
-  1 : 2 : 3 :
-    invoke
-      (H \k b -> if b then kickit k else [])
-      ( use 4 id .
-        use 5 (use 7 (use 8 (use 9 id))) .
-        use 6 id .
-        id
-      )
-      True
-
-  1 : 2 : 3 :
-    if True
-      then
-        kickit
-          ( use 4 id .
-            use 5 (use 7 (use 8 (use 9 id))) .
-            use 6 id .
-            id
-          )
-      else []
-
-  1 : 2 : 3 :
-    kickit
-      ( use 4 id .
-        use 5 (use 7 (use 8 (use 9 id))) .
-        use 6 id .
-        id
-      )
-
-  1 : 2 : 3 :
-    invoke
-      ( use 4 id .
-        use 5 (use 7 (use 8 (use 9 id))) .
-        use 6 id .
-        id
-      )
-      (H \k b -> if b then kickit k else [])
-      False
-
-  1 : 2 : 3 :
-    invoke
-      (use 4 id)
-      ( use 5 (use 7 (use 8 (use 9 id))) .
-        use 6 id .
-        id .
-        (H \k b -> if b then kickit k else [])
-      )
-      False
-
-  1 : 2 : 3 : 4 :
-    invoke
-      ( use 5 (use 7 (use 8 (use 9 id))) .
-        use 6 id .
-        id .
-        (H \k b -> if b then kickit k else [])
-      )
-      id
-      True
-
-  1 : 2 : 3 : 4 : 5 :
-    invoke
-      ( use 6 id .
-        id .
-        (H \k b -> if b then kickit k else []) .
-        id
-      )
-      (use 7 (use 8 (use 9 id)))
-      True
-
-  1 : 2 : 3 : 4 : 5 :
-    invoke
-      (use 6 id)
-      ( id .
-        (H \k b -> if b then kickit k else []) .
-        id .
-        use 7 (use 8 (use 9 id))
-      )
-      True
-
-  1 : 2 : 3 : 4 : 5 : 6 :
-    invoke
-      ( id .
-        (H \k b -> if b then kickit k else []) .
-        id .
-        use 7 (use 8 (use 9 id))
-      )
-      id
-      True
-
-  1 : 2 : 3 : 4 : 5 : 6 :
-    if True
-      then
-        kickit
-          ( id .
-            use 7 (use 8 (use 9 id)) .
-            id .
-            id
-          )
-      else []
-
-  1 : 2 : 3 : 4 : 5 : 6 : 7 :
-    invoke
-      ( id .
-        id .
-        (H \k b -> if b then kickit k else []) .
-        id
-      )
-      (use 8 (use 9 id))
-      True
-
-  1 : 2 : 3 : 4 : 5 : 6 : 7 :
-    kickit
-      ( id .
-        use 8 (use 9 id) .
-        id .
-        id
-      )
-
-  1 : 2 : 3 : 4 : 5 : 6 : 7 : 8 :
-    kickit
-      ( id .
-        use 9 id .
-        id .
-        id
-      )
-
-  1 : 2 : 3 : 4 : 5 : 6 : 7 : 8 : 9 :
-    kickit
-      ( id .
-        id .
-        id .
-        id
-      )
-
-  1 : 2 : 3 : 4 : 5 : 6 : 7 : 8 : 9 :
-    invoke
-      ( id .
-        id .
-        id .
-        id
-      )
-      (H \k b -> if b then kickit k else [])
-      False
-
-  1 : 2 : 3 : 4 : 5 : 6 : 7 : 8 : 9 : []
-
-}}} -}
+{-# INLINE longInterleavingOld #-}
 
 zipping :: (Foldable f, Monoid o) => f a -> (a -> o) -&> o
 zipping = foldr send (rep mempty)
@@ -501,71 +205,71 @@ instance (Foldable f, Foldable (DaisyChain (ff ': fs))) => Foldable (DaisyChain 
 
 hybase :: IO ()
 hybase = do
-  print $ zipWith4 (,,,) [1, 2, 3 :: Int] ['a', 'b', 'c', 'd'] [True, False, True] [(), (), ()]
-  print $ toList (Grow [1, 2, 3 :: Int] ['a', 'b', 'c', 'd'] (,))
-  print $ toList (Link (,,) :=: [1, 2, 3 :: Int] :=: ['a', 'b', 'c', 'd'] :=: [True, False, True])
-  print $ zipWith2 (,) [1, 2, 3 :: Int] ['a', 'b', 'c', 'd']
-  print @[Int] $ -- [1,2,3]
-    invoke
-      (rep (1 :) . rep (2 :) . rep (3 :))
-      (pure [])
-  print @[Int] $ -- [1,2,3,4,1,2,3]
-    invoke
-      (rep (1 :) . rep (2 :) . rep (3 :))
-      ((4 :) !> pure [])
-  print @[Int] $ -- [1,2,3,4,1,2,3,5,1,2,3]
-    invoke
-      (rep (1 :) . rep (2 :) . rep (3 :))
-      ((4 :) !> (5 :) !> pure [])
-  print @(Int, Int, Int) $ -- (1,2,3)
-    invoke
-      (pass 1 . pass 2 . pass 3)
-      (pure (\z y x -> (x, y, z)))
-  print @[(Int, Int, Int)] $ -- [(2,4,6), (1,2,3)]
-    invoke
-      (pass 1 . pass 2 . pass 3)
-      ((\t z y x -> (x * 2, y * 2, z * 2) : t) !> pure (\z y x -> [(x, y, z)]))
-  print @[Int] $ -- [1,2,3,1,2,3,1,2,3,1,2,3,1,2,3,1,2,3,1,2]
-    take 20 $
-      run (rep (1 :) . rep (2 :) . rep (3 :))
-  print @[(Int, Int, Int)] $ -- [(2,4,6),(2,4,6),(2,4,6)]
-    take 3 $
-      run (pass 1 . pass 2 . pass 3 . rep (\t z y x -> (x * 2, y * 2, z * 2) : t))
-  print @[(Int, Int)] $ -- [(0,1000),(102,1001),(204,1002)]
-    take 3 $
-      run
-        ( rep (\next -> next 100)
-            . rep (\next prev -> next (prev + 2))
-            . rep (\next -> next 1000)
-            . rep (\next prev1 prev2 s -> (prev2 * s, prev1 + s) : next (s + 1))
-        )
-        (0 :: Int)
-  print @[(Int, Int, Int)] $ -- [(2,3,0),(22,3,1),(2,3,2),(22,3,3),(2,3,4),(22,3,5),(2,3,6),(22,3,7),(2,3,8),(22,3,9)]
-    take 10 $
-      run
-        ( rep (\next -> next (,,))
-            . unsafeCycleReps [\next prev -> next (prev 2), \next prev -> next (prev 22)]
-            . rep (\next prev -> next (prev 3))
-            . rep (\next prev s -> prev s : next (s + 1))
-        )
-        (0 :: Int)
-  print @[Int] $ -- [0,1,2,3,6,7,14,15,30,31]
-    take 10 $
-      run
-        ( rep (\next s -> s : next (s + 1))
-            . rep (\next s -> s : next (s * 2))
-        )
-        (0 :: Int)
-  print @[Int] $
-    take 20 $
-      run
-        ( together
-            (rep (0 :))
-            ( together
-                (rep (1 :))
-                (rep (2 :))
-            )
-        )
+  -- print $ zipWith4 (,,,) [1, 2, 3 :: Int] ['a', 'b', 'c', 'd'] [True, False, True] [(), (), ()]
+  -- print $ toList (Grow [1, 2, 3 :: Int] ['a', 'b', 'c', 'd'] (,))
+  -- print $ toList (Link (,,) :=: [1, 2, 3 :: Int] :=: ['a', 'b', 'c', 'd'] :=: [True, False, True])
+  -- print $ zipWith2 (,) [1, 2, 3 :: Int] ['a', 'b', 'c', 'd']
+  -- print @[Int] $ -- [1,2,3]
+  --   invoke
+  --     (rep (1 :) . rep (2 :) . rep (3 :))
+  --     (pure [])
+  -- print @[Int] $ -- [1,2,3,4,1,2,3]
+  --   invoke
+  --     (rep (1 :) . rep (2 :) . rep (3 :))
+  --     ((4 :) !> pure [])
+  -- print @[Int] $ -- [1,2,3,4,1,2,3,5,1,2,3]
+  --   invoke
+  --     (rep (1 :) . rep (2 :) . rep (3 :))
+  --     ((4 :) !> (5 :) !> pure [])
+  -- print @(Int, Int, Int) $ -- (1,2,3)
+  --   invoke
+  --     (pass 1 . pass 2 . pass 3)
+  --     (pure (\z y x -> (x, y, z)))
+  -- print @[(Int, Int, Int)] $ -- [(2,4,6), (1,2,3)]
+  --   invoke
+  --     (pass 1 . pass 2 . pass 3)
+  --     ((\t z y x -> (x * 2, y * 2, z * 2) : t) !> pure (\z y x -> [(x, y, z)]))
+  -- print @[Int] $ -- [1,2,3,1,2,3,1,2,3,1,2,3,1,2,3,1,2,3,1,2]
+  --   take 20 $
+  --     run (rep (1 :) . rep (2 :) . rep (3 :))
+  -- print @[(Int, Int, Int)] $ -- [(2,4,6),(2,4,6),(2,4,6)]
+  --   take 3 $
+  --     run (pass 1 . pass 2 . pass 3 . rep (\t z y x -> (x * 2, y * 2, z * 2) : t))
+  -- print @[(Int, Int)] $ -- [(0,1000),(102,1001),(204,1002)]
+  --   take 3 $
+  --     run
+  --       ( rep (\next -> next 100)
+  --           . rep (\next prev -> next (prev + 2))
+  --           . rep (\next -> next 1000)
+  --           . rep (\next prev1 prev2 s -> (prev2 * s, prev1 + s) : next (s + 1))
+  --       )
+  --       (0 :: Int)
+  -- print @[(Int, Int, Int)] $ -- [(2,3,0),(22,3,1),(2,3,2),(22,3,3),(2,3,4),(22,3,5),(2,3,6),(22,3,7),(2,3,8),(22,3,9)]
+  --   take 10 $
+  --     run
+  --       ( rep (\next -> next (,,))
+  --           . unsafeCycleReps [\next prev -> next (prev 2), \next prev -> next (prev 22)]
+  --           . rep (\next prev -> next (prev 3))
+  --           . rep (\next prev s -> prev s : next (s + 1))
+  --       )
+  --       (0 :: Int)
+  -- print @[Int] $ -- [0,1,2,3,6,7,14,15,30,31]
+  --   take 10 $
+  --     run
+  --       ( rep (\next s -> s : next (s + 1))
+  --           . rep (\next s -> s : next (s * 2))
+  --       )
+  --       (0 :: Int)
+  -- print @[Int] $
+  --   take 20 $
+  --     run
+  --       ( together
+  --           (rep (0 :))
+  --           ( together
+  --               (rep (1 :))
+  --               (rep (2 :))
+  --           )
+  --       )
   mempty
 
 zipWith2 ::
@@ -576,303 +280,69 @@ zipWith2 o xs ys =
   run $ zipping xs . zipping ys . rep \r y x -> o x y : r
 {-# INLINE zipWith2 #-}
 
--- {{{
-bongos :: ()
-bongos = do
-  let _ = zipWith2 (,) [1, 2, 3 :: Int] ['a', 'b', 'c', 'd']
-  let _ = run $ zipping [1, 2, 3 :: Int] . zipping ['a', 'b', 'c', 'd'] . rep \r y x -> (x, y) : r
-  let _ = invoke (zipping [1, 2, 3 :: Int] . zipping ['a', 'b', 'c', 'd'] . rep \r y x -> (x, y) : r) id
-  let _ = invoke (zipping [1, 2, 3 :: Int] . zipping ['a', 'b', 'c', 'd'] . rep \r y x -> (x, y) : r) (H run)
-  let _ = invoke (zipping [1, 2, 3 :: Int] . (zipping ['a', 'b', 'c', 'd'] . rep \r y x -> (x, y) : r)) (H run)
-  let _ = invoke (H \k -> invoke (zipping [1, 2, 3 :: Int]) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . k)) (H run)
-  let _ = invoke (zipping [1, 2, 3 :: Int]) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-  let _ = invoke (foldr (\y t -> ($ y) !> t) (rep mempty) [1, 2, 3 :: Int]) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-  let _ = invoke ((\y t -> ($ y) !> t) (1 :: Int) (foldr (\y t -> ($ y) !> t) (rep mempty) [2, 3 :: Int])) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-  let _ = invoke (($ (1 :: Int)) !> foldr (\y t -> ($ y) !> t) (rep mempty) [2, 3 :: Int]) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-  let _ = invoke (($ (1 :: Int)) !> ($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-  let _ = invoke (H \k -> ($ (1 :: Int)) (invoke k $ ($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-  let _ = (\k -> ($ (1 :: Int)) (invoke k $ ($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-  let _ =
-        ($ (1 :: Int))
-          ( invoke
-              (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-              $ ($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty
-          )
-  let _ =
-        invoke
-          (zipping ['a', 'b', 'c', 'd'] . rep (\r y x -> (x, y) : r) . H run)
-          (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-          (1 :: Int)
-  let _ =
-        invoke
-          ( H \k ->
-              invoke
-                (zipping ['a', 'b', 'c', 'd'])
-                (rep (\r y x -> (x, y) : r) . H run . k)
-          )
-          (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-          (1 :: Int)
-  let _ =
-        invoke
-          (zipping ['a', 'b', 'c', 'd'])
-          (rep (\r y x -> (x, y) : r) . H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty))
-          (1 :: Int)
-  let _ =
-        invoke
-          (foldr (\y t -> ($ y) !> t) (rep mempty) ['a', 'b', 'c', 'd'])
-          (rep (\r y x -> (x, y) : r) . H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty))
-          (1 :: Int)
-  let _ =
-        invoke
-          (($ 'a') !> ($ 'b') !> ($ 'c') !> rep mempty)
-          (rep (\r y x -> (x, y) : r) . H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty))
-          (1 :: Int)
-  let _ =
-        invoke
-          (H \k -> ($ 'a') (invoke k (($ 'b') !> ($ 'c') !> rep mempty)))
-          (rep (\r y x -> (x, y) : r) . H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty))
-          (1 :: Int)
-  let _ =
-        ($ 'a')
-          (invoke (rep (\r y x -> (x, y) : r) . H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) (($ 'b') !> ($ 'c') !> rep mempty))
-          (1 :: Int)
-  let _ =
-        ( invoke
-            (rep (\r y x -> (x, y) : r) . H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty))
-            (($ 'b') !> ($ 'c') !> rep mempty)
-        )
-          'a'
-          (1 :: Int)
-  let _ =
-        ( invoke
-            ( H \k ->
-                invoke
-                  (rep (\r y x -> (x, y) : r))
-                  ((H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) . k)
-            )
-            (($ 'b') !> ($ 'c') !> rep mempty)
-        )
-          'a'
-          (1 :: Int)
-  let _ =
-        ( invoke
-            (rep (\r y x -> (x, y) : r))
-            ((H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) . (($ 'b') !> ($ 'c') !> rep mempty))
-        )
-          'a'
-          (1 :: Int)
-  let _ =
-        ( invoke
-            ((\r y x -> (x, y) : r) !> rep (\r y x -> (x, y) : r))
-            ((H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) . (($ 'b') !> ($ 'c') !> rep mempty))
-        )
-          'a'
-          (1 :: Int)
-  let _ =
-        ( invoke
-            ( H \k ->
-                (\r y x -> (x, y) : r) (invoke k (rep (\r y x -> (x, y) : r)))
-            )
-            ((H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) . (($ 'b') !> ($ 'c') !> rep mempty))
-        )
-          'a'
-          (1 :: Int)
-  let _ =
-        ( invoke
-            (H \k yy xx -> (xx, yy) : (invoke k (rep (\r y x -> (x, y) : r))))
-            ((H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) . (($ 'b') !> ($ 'c') !> rep mempty))
-        )
-          'a'
-          (1 :: Int)
-  let _ =
-        ( \yy xx ->
-            (xx, yy) : (invoke ((H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) . (($ 'b') !> ($ 'c') !> rep mempty)) (rep (\r y x -> (x, y) : r)))
-        )
-          'a'
-          (1 :: Int)
-  let _ =
-        (1 :: Int, 'a')
-          : (invoke ((H run . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)) . (($ 'b') !> ($ 'c') !> rep mempty)) (rep (\r y x -> (x, y) : r)))
-  let _ =
-        (1 :: Int, 'a')
-          : ( invoke
-                ( H run
-                    . (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-                    . (($ 'b') !> ($ 'c') !> rep mempty)
-                )
-                (rep (\r y x -> (x, y) : r))
-            )
-  let _ =
-        (1 :: Int, 'a')
-          : ( invoke
-                ( H \k ->
-                    invoke
-                      (H run)
-                      ( (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-                          . (($ 'b') !> ($ 'c') !> rep mempty)
-                          . k
-                      )
-                )
-                (rep (\r y x -> (x, y) : r))
-            )
-  let _ =
-        (1 :: Int, 'a')
-          : ( invoke
-                (H run)
-                ( (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-                    . (($ 'b') !> ($ 'c') !> rep mempty)
-                    . rep (\r y x -> (x, y) : r)
-                )
-            )
-  let _ =
-        (1 :: Int, 'a')
-          : ( invoke
-                (H \k -> invoke k id)
-                ( (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-                    . (($ 'b') !> ($ 'c') !> rep mempty)
-                    . rep (\r y x -> (x, y) : r)
-                )
-            )
-  let _ =
-        (1 :: Int, 'a')
-          : ( invoke
-                ( (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-                    . (($ 'b') !> ($ 'c') !> rep mempty)
-                    . rep (\r y x -> (x, y) : r)
-                )
-                id
-            )
-  let _ =
-        (1 :: Int, 'a')
-          : ( invoke
-                ( (($ (2 :: Int)) !> ($ (3 :: Int)) !> rep mempty)
-                    . (($ 'b') !> ($ 'c') !> rep mempty)
-                    . rep (\r y x -> (x, y) : r)
-                )
-                (H run)
-            )
-  ()
-
--- }}}
-
--- invoke (rep x . rep y . rep z) id
--- invoke (rep x) (rep y . rep z . id)
--- x $ invoke (rep y . rep z . id) (rep x)
--- x $ invoke (rep y) (rep z . id . rep x)
--- x $ y $ invoke (rep z . id . rep x) (rep y)
--- x $ y $ invoke (rep z) (id . rep x . rep y)
--- x $ y $ z $ invoke (id . rep x . rep y) (rep z)
--- x $ y $ z $ invoke id (rep x . rep y . rep z)
--- x $ y $ z $ invoke (rep x . rep y . rep z) id
--- x $ y $ z $ x $ y $ z $ ...
+-- $> main
 
 main :: IO ()
 main = do
   hybase
-  print @[Int] $ build (fold [1, 2, 3, 4, 5])
-  print $ lockstepH id [1, 2 :: Int] "ABC"
-  xs <-
-    lockstepA
-      ( \case
-          Both a b -> do
-            let x = show (a, b)
-            putStrLn x
-            pure x
-          This a -> do
-            let x = show a
-            putStrLn x
-            pure x
-          That b -> do
-            let x = show b
-            putStrLn x
-            pure x
-      )
-      [1, 2 :: Int]
-      "ABC"
-  print xs
+  -- print @[Int] $ build (fold [1, 2, 3, 4, 5])
+  -- print $ lockstep id [1, 2 :: Int] "ABC"
+  -- print $ lockstepH id [1, 2 :: Int] "ABC"
+  -- xs <-
+  --   lockstepA
+  --     ( \case
+  --         Both a b -> do
+  --           let x = show (a, b)
+  --           putStrLn x
+  --           pure x
+  --         This a -> do
+  --           let x = show a
+  --           putStrLn x
+  --           pure x
+  --         That b -> do
+  --           let x = show b
+  --           putStrLn x
+  --           pure x
+  --     )
+  --     [1, 2 :: Int]
+  --     "ABC"
+  -- print xs
 
-  print $ shortInterleave @Int [1, 3, 5, 0, 0] [2, 4] -- [1,2,3,4,5]
-  print $ longInterleave @Int [1, 3, 5] [2, 4, 6, 7] -- [1,2,3,4,5,6,7]
-  print $ shortInterleaving @Int [[1, 4, 7, 0], [2, 5], [3, 6, 0, 0]] -- [1,2,3,4,5,6,7]
+  -- print $ shortInterleave @Int [1, 3, 5, 0, 0] [2, 4] -- [1,2,3,4,5]
+  -- print $ longInterleave @Int [1, 3, 5] [2, 4, 6, 7] -- [1,2,3,4,5,6,7]
+  -- print $ shortInterleaving @Int [[1, 4, 7, 0], [2, 5], [3, 6, 0, 0]] -- [1,2,3,4,5,6,7]
+  -- print $ take 10 $ longInterleavingOld @Int [[1, 2, 3], repeat 0, [4, 5]] -- [1,0,4,2,0,5,3,0,0,0]
+  -- print $ take 10 $ longInterleavingOld @Int [[1 ..], [10 ..], [100 ..]] -- [1,10,100,2,11,101,3,12,102,4]
+  -- print $ take 10 $ longInterleavingOld @Int (repeat [1]) -- [1,1,1,1,1,1,1,1,1,1]
+  -- print $ take 10 $ longInterleavingOld @Int (tails [1 ..]) -- [1,2,3,4,5,6,7,8,9,10]
+  -- print $ longInterleavingOld @Int @[] @[] [] -- []
+  -- print $ longInterleavingOld @Int [[]] -- []
+  -- print $ longInterleavingOld @Int [[], []] -- []
+  -- print $ take 1 $ longInterleavingOld @Int (repeat []) -- non-termination
+
+  print $ take 10 $ longInterleaving @Int ([] :: [[Int]])
+  print $ take 10 $ longInterleaving @Int [[]]
+  print $ take 10 $ longInterleaving @Int [[1]]
+  print $ take 10 $ longInterleaving @Int [[1, 2]]
+  print $ take 10 $ longInterleaving @Int [[1], [2]]
+  print $ take 10 $ longInterleavingOld @Int [[1, 2, 3], repeat 0, [4, 5]] -- [1,0,4,2,0,5,3,0,0,0]
   print $ take 10 $ longInterleaving @Int [[1, 2, 3], repeat 0, [4, 5]] -- [1,0,4,2,0,5,3,0,0,0]
-  print $ take 10 $ longInterleaving @Int [[1 ..], [10 ..], [100 ..]] -- [1,10,100,2,11,101,3,12,102,4]
-  print $ take 10 $ longInterleaving @Int (repeat [1]) -- [1,1,1,1,1,1,1,1,1,1]
-  print $ take 10 $ longInterleaving @Int (tails [1 ..]) -- [1,2,3,4,5,6,7,8,9,10]
-  print $ longInterleaving @Int @[] @[] [] -- []
-  print $ longInterleaving @Int [[]] -- []
-  print $ longInterleaving @Int [[], []] -- []
-  -- print $ take 1 $ longInterleaving @Int (repeat []) -- non-termination
 
   --
-  mapM_ (print @(Int, Int)) $
-    take 20 do
-      0 & do
-        run
-          ( (fix \me -> H \k n -> (0, n) : (invoke k me $! n + 1))
-              . (fix \me -> H \k n -> (1, n * 100) : (invoke k me $! n + 2))
-              . (fix \me -> H \k n -> (2, n * 100) : (invoke k me $! n + 3))
-          )
+  -- mapM_ (print @(Int, Int)) $
+  --   take 20 do
+  --     0 & do
+  --       run
+  --         ( (fix \me -> H \k n -> (0, n) : (invoke k me $! n + 1))
+  --             . (fix \me -> H \k n -> (1, n * 100) : (invoke k me $! n + 2))
+  --             . (fix \me -> H \k n -> (2, n * 100) : (invoke k me $! n + 3))
+  --         )
 
   --
-  print @[(Int, Int)] $
-    Ap.retractAp
-      ( apBuild
-          ( apFold
-              ( (,)
-                  <$> Ap.liftAp [1, 2, 3]
-                  <*> Ap.liftAp [1, 2, 3]
-              )
-          )
-      )
-
+  -- print $ longInterleave @Int [1, 3, 5] [2, 4, 6, 7] -- [1,2,3,4,5,6,7]
   -- print $ grun (gsingle 1 :: G Int Int Int)
   mempty
--- print $ bloink [1, 2, 3, 4, 5 :: Int]
 {-# INLINE main #-}
-
-data Product t s c = Product (t c) (s c)
-
--- t (a, Maybe b -> f c) -> s (b, Maybe a -> f c) -> f (Product t s c)
-
-newtype Clown s b c x = Clown {getClown :: (Maybe b -> c) -> s b -> (s c, x)}
-  deriving
-    (Functor, Applicative)
-    via (->) (Maybe b -> c)
-      `Compose` (->) (s b)
-      `Compose` (,) (s c)
-
--- bloink :: forall t. (Traversable t) => t Int -> (t [Int], t [Int])
--- bloink ts = do
---   let _ppt = for ts \a -> rep (a :)
---   let _pps = for ts \b -> rep (b * 10 :)
---
---   let _pph = do
---         l <- _ppt
---         r <- _pps
---         pure (l, r)
---
---   let _m = invoke _pph (pure [])
---   _m
-
--- lockstep ::
---   (Traversable t, Traversable s) =>
---   (Maybe a -> Maybe b -> c) -> t a -> s b -> (t c, s c)
--- lockstep f ts ss = do
---   let ppt = getCompose $ ts & traverse \a -> Compose (send (Just a))
---   let pt = ppt (pass Nothing)
---
---   -- let pps = getCompose $ ss & traverse \b -> Compose (send (Just b))
---   -- let ps = pps (pass Nothing)
---
---   -- let done = H \k ->
---   --       _ $
---   --         invoke pt $ H \j ->
---   --           _ $ invoke ps $ H \i ->
---   --                 _ f k j i
---   -- run done
---
---
---   run $ pt . rep _
 
 data FunList a c r
   = Done r
@@ -965,31 +435,175 @@ lockstepA f ts ss = go (walk ts) (walk ss)
         <$> f (That b)
         <*> go (Done tc) ks
 
--- newtype G c a b = G {runG :: G c (c -> b) (c -> a) -> b}
---
--- instance Profunctor (G c) where
---   dimap f g h = G $ g . runG h . dimap (fmap g) (fmap f)
---   {-# INLINE dimap #-}
---
--- instance Applicative (G c a) where
---   pure = gpure
---   gf <*> gx = G \k -> do
---     let f =
---           runG gf $ G \gf' -> do
---             runG k $ G \hhh -> do
---               let lol :: (c -> c -> x -> b) -> (c -> c -> x) -> c -> c -> b
---                   lol x y z w = x z w (y z w)
---               let _x = runG gx $ G \gx' -> runG k (liftA2 lol gf' gx')
---               _ hhh _x
---     let x = runG gx $ G \gx' -> runG k (dimap undefined undefined gf <*> dimap undefined undefined gx')
---     f x
---   {-# INLINE (<*>) #-}
---
--- gpure :: b -> G c a b
--- gpure v = G \_ -> v
+{-
+newtype IxH g h x = IxH
+  { elimIxH ::
+      forall r.
+      (x -> r) ->
+      ( forall a.
+        (forall b. g (a -> b) -> h b) ->
+        IxH g h (a -> x) ->
+        r
+      ) ->
+      r
+  }
 
--- gsingle :: b -> G b a a
--- gsingle b = G \k -> runG k (gsingle b) b
---
--- grun :: G c c b -> b
--- grun g = runG g (gpure id)
+runIxH :: (forall a. a -> g a) -> IxH g g x -> g x
+runIxH n h = elimIxH h n \step t -> step (runIxH n t)
+{-# INLINE runIxH #-}
+
+ipure :: x -> IxH g h x
+ipure x = IxH \p _ -> p x
+{-# INLINE ipure #-}
+
+icons :: (forall b. g (a -> b) -> h b) -> IxH g h (a -> x) -> IxH g h x
+icons step t = IxH \_ c -> c step t
+{-# INLINE icons #-}
+
+ixMap :: (x -> y) -> IxH g h x -> IxH g h y
+ixMap f h = elimIxH h (ipure . f) \step t -> icons step (ixMap (f .) t)
+{-# INLINE ixMap #-}
+
+ixLift2 :: (x -> y -> z) -> IxH g h x -> IxH g h y -> IxH g h z
+ixLift2 f = goL f
+  where
+    goL :: (x -> y -> z) -> IxH g h x -> IxH g h y -> IxH g h z
+    goL k l r =
+      elimIxH
+        l
+        (\x -> ixMap (k x) r)
+        (\step lt -> icons step (goR (\ax y a -> k (ax a) y) lt r))
+
+    goR :: (x -> y -> z) -> IxH g h x -> IxH g h y -> IxH g h z
+    goR k l r =
+      elimIxH
+        r
+        (\y -> ixMap (\x -> k x y) l)
+        (\step rt -> icons step (goL (\x ay a -> k x (ay a)) l rt))
+{-# INLINE ixLift2 #-}
+
+class IxCategory k where
+  ixId :: x -> k g h x
+  ixComp :: (x -> y -> z) -> k f g x -> k h f y -> k h g z
+
+-- instance IxCategory IxH where
+--   ixId = ipure
+--   ixComp = _
+
+apFold ::
+  forall x f g h.
+  Ap f x ->
+  (forall a b. f a -> g (a -> b) -> h b) ->
+  IxH g h x
+apFold ap c = case ap of
+  Ap.Pure x -> ipure x
+  Ap.Ap h t -> icons (c h) (apFold t c)
+
+apBuild ::
+  (forall g h. (forall a b. f a -> g (a -> b) -> h b) -> IxH g h x) ->
+  Ap f x
+apBuild g = runIxH Ap.Pure (g Ap.Ap)
+
+longInterleaveAp :: forall f z y x. (x -> y -> z) -> Ap f x -> Ap f y -> Ap f z
+longInterleaveAp f l r = runIxH Ap.Pure (ixLift2 f (apFold l Ap.Ap) (apFold r Ap.Ap))
+{-# INLINE longInterleaveAp #-}
+
+longInterleavingAp :: forall f x. Ap (Ap f) x -> Ap f x
+longInterleavingAp ap = go (apFold ap Ap.Ap)
+  where
+    go :: IxH (Ap (Ap f)) (Ap (Ap f)) y -> Ap f y
+    go q =
+      elimIxH q Ap.Pure \step rest ->
+        processFront (step (Ap.Pure id)) rest
+
+    processFront ::
+      forall a y.
+      Ap (Ap f) a ->
+      IxH (Ap (Ap f)) (Ap (Ap f)) (a -> y) ->
+      Ap f y
+    processFront front rest = case front of
+      Ap.Pure y -> go (ixMap ($ y) rest)
+      Ap.Ap inner outerTail -> case inner of
+        Ap.Pure y -> processFront (($ y) <$> outerTail) rest
+        Ap.Ap h t ->
+          Ap.Ap h $
+            go $
+              ixAppendEffect
+                (\r ay a -> r (ay a))
+                (ixAppendApply (apFold outerTail Ap.Ap) (ixMap (\r k a -> r (k a)) rest))
+                t
+
+    ixAppendApply ::
+      forall u v.
+      IxH (Ap (Ap f)) (Ap (Ap f)) u ->
+      IxH (Ap (Ap f)) (Ap (Ap f)) (u -> v) ->
+      IxH (Ap (Ap f)) (Ap (Ap f)) v
+    ixAppendApply l r =
+      elimIxH
+        l
+        (\x -> ixMap ($ x) r)
+        ( \step rest ->
+            icons step $
+              ixAppendApply rest (ixMap (\xy ax -> xy . ax) r)
+        )
+
+    ixAppendEffect ::
+      forall a y z.
+      (y -> a -> z) ->
+      IxH (Ap (Ap f)) (Ap (Ap f)) y ->
+      Ap f a ->
+      IxH (Ap (Ap f)) (Ap (Ap f)) z
+    ixAppendEffect f q e =
+      elimIxH
+        q
+        (\y -> icons (Ap.Ap e) (ipure (f y)))
+        ( \step rest ->
+            icons step $
+              ixAppendEffect (\ay a x -> f (ay x) a) rest e
+        )
+{-# INLINE longInterleavingAp #-}
+
+longInterleavingAp' :: forall f x. Ap (Ap f) x -> Ap f x
+longInterleavingAp' = \case
+  Ap.Pure x -> Ap.Pure x
+  Ap.Ap inner rest -> case inner of
+    Ap.Pure y -> longInterleavingAp' (($ y) <$> rest)
+    Ap.Ap h t ->
+      Ap.Ap h $
+        longInterleavingAp' $
+          (\k ay a -> k (ay a)) <$> rest <*> Ap.liftAp t
+{-# INLINE longInterleavingAp' #-}
+
+mainAp = do
+  print @[(Int, Int)] $
+    Ap.retractAp
+      ( apBuild
+          ( apFold
+              ( (,)
+                  <$> Ap.liftAp [1, 2, 3]
+                  <*> Ap.liftAp [1, 2, 3]
+              )
+          )
+      )
+
+  print @(String, (Int, Int)) $
+    Ap.retractAp $
+      longInterleaveAp
+        (,)
+        (Ap.Ap ("L1", 1 :: Int) (Ap.Ap ("L2", 10 :: Int) (Ap.Pure (\a b -> a + b))))
+        (Ap.Ap ("R1", 100 :: Int) (Ap.Ap ("R2", 1000 :: Int) (Ap.Ap ("R3", 10000 :: Int) (Ap.Pure (\a b c -> a + b + c)))))
+
+  print @(String, (Int, Int, Int)) $
+    Ap.retractAp $
+      longInterleavingAp $
+        Ap.Ap
+          (Ap.Ap ("A1", 1 :: Int) (Ap.Ap ("A2", 10 :: Int) (Ap.Pure (\a b -> a + b))))
+          ( Ap.Ap
+              (Ap.Ap ("B1", 100 :: Int) (Ap.Pure id))
+              ( Ap.Ap
+                  (Ap.Ap ("C1", 1000 :: Int) (Ap.Ap ("C2", 10000 :: Int) (Ap.Pure (\a b -> a + b))))
+                  (Ap.Pure (\a b c -> (a, b, c)))
+              )
+          )
+
+-}
